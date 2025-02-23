@@ -19,7 +19,7 @@ An interactive tool for explaining presentation slides using AI and text-to-spee
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/slide_explainer.git
+git clone https://github.com/AntonioSabbatellaUni/Slides-Explainer
 cd slide_explainer
 ```
 
