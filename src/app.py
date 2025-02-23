@@ -14,6 +14,14 @@ from utils.audio_handler import AudioHandler
 from utils.llm_interface import LLMInterface
 from utils.slide_processor import SlideProcessor
 import pandas as pd
+from docx import Document
+from docx.shared import Inches, RGBColor, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import io
+from utils.context_manager import ContextManager, DEFAULT_CONSTRAINTS
+import markdown
+from bs4 import BeautifulSoup
+import docx
 
 # Load environment variables
 load_dotenv()
@@ -47,6 +55,12 @@ if "saved_notes" not in st.session_state:
     st.session_state.saved_notes = set()
 if "edited_explanations" not in st.session_state:
     st.session_state.edited_explanations = {}
+if "notes_format" not in st.session_state:
+    st.session_state.notes_format = "docx"
+if "context_manager" not in st.session_state:
+    st.session_state.context_manager = ContextManager()
+if "custom_constraints" not in st.session_state:
+    st.session_state.custom_constraints = {}
 
 # Initialize handlers
 audio_handler = AudioHandler()
@@ -314,13 +328,135 @@ def clear_all_caches():
     st.session_state.next_cache_index = None
     st.session_state.saved_notes = set()
     st.session_state.notes_file = None
+    st.session_state.context_manager.clear_context()  # Clear context
 
-def get_notes_filename(uploaded_file_name: str) -> str:
-    """Generate the notes filename from the uploaded file name."""
+def get_notes_filename(uploaded_file_name: str, format_type: str) -> str:
+    """
+    Generate the notes filename from the uploaded file name.
+    
+    Parameters
+    ----------
+    uploaded_file_name : str
+        The name of the uploaded file.
+    format_type : str
+        The desired format type ('txt' or 'docx').
+    
+    Returns
+    -------
+    str
+        The generated filename with appropriate extension.
+    """
     base_name = os.path.splitext(uploaded_file_name)[0]
-    return f"notes_{base_name}.txt"
+    extension = ".txt" if format_type == "txt" else ".docx"
+    return f"notes_{base_name}{extension}"
 
-def save_explanation_to_notes(explanation: str, start_idx: int) -> None:
+def format_markdown_for_docx(doc, text: str) -> None:
+    """
+    Format markdown text for Word document with proper styling using markdown library.
+    
+    Parameters
+    ----------
+    doc : Document
+        The Word document to format.
+    text : str
+        The markdown text to format.
+    """
+    # Convert markdown to HTML
+    html = markdown.markdown(text, extensions=['extra'])
+    
+    # Parse HTML with BeautifulSoup
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    def process_element(element, parent_paragraph=None):
+        """Recursively process HTML elements and apply formatting."""
+        if element.name is None:
+            # Text node
+            if parent_paragraph is None:
+                parent_paragraph = doc.add_paragraph()
+            parent_paragraph.add_run(element.string or '')
+            return parent_paragraph
+            
+        if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            # Headers
+            level = int(element.name[1])
+            p = doc.add_paragraph(element.get_text())
+            p.style = f'Heading {level}'
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            return p
+            
+        elif element.name == 'p':
+            # Paragraphs
+            p = doc.add_paragraph()
+            for child in element.children:
+                process_element(child, p)
+            return p
+            
+        elif element.name == 'code':
+            # Code blocks
+            if parent_paragraph is None:
+                parent_paragraph = doc.add_paragraph()
+            run = parent_paragraph.add_run(element.get_text())
+            run.font.name = 'Courier New'
+            run.font.color.rgb = RGBColor(199, 37, 78)  # Red color for code
+            run.font.size = Pt(10)
+            return parent_paragraph
+            
+        elif element.name == 'strong':
+            # Bold text
+            if parent_paragraph is None:
+                parent_paragraph = doc.add_paragraph()
+            run = parent_paragraph.add_run(element.get_text())
+            run.bold = True
+            return parent_paragraph
+            
+        elif element.name == 'em':
+            # Italic text
+            if parent_paragraph is None:
+                parent_paragraph = doc.add_paragraph()
+            run = parent_paragraph.add_run(element.get_text())
+            run.italic = True
+            return parent_paragraph
+            
+        elif element.name == 'ul':
+            # Unordered lists
+            for li in element.find_all('li', recursive=False):
+                p = doc.add_paragraph(style='List Bullet')
+                process_element(li, p)
+            return None
+            
+        elif element.name == 'ol':
+            # Ordered lists
+            for i, li in enumerate(element.find_all('li', recursive=False), 1):
+                p = doc.add_paragraph(style='List Number')
+                process_element(li, p)
+            return None
+            
+        elif element.name == 'pre':
+            # Code blocks
+            p = doc.add_paragraph()
+            run = p.add_run(element.get_text())
+            run.font.name = 'Courier New'
+            run.font.color.rgb = RGBColor(199, 37, 78)
+            run.font.size = Pt(10)
+            return p
+            
+        else:
+            # Process other elements recursively
+            if parent_paragraph is None:
+                parent_paragraph = doc.add_paragraph()
+            for child in element.children:
+                process_element(child, parent_paragraph)
+            return parent_paragraph
+    
+    # Process the HTML tree
+    for element in soup.children:
+        process_element(element)
+
+def save_explanation_to_notes(
+    explanation: str,
+    start_idx: int,
+    grid_image=None
+) -> None:
     """
     Save the explanation to the notes file and update the cache.
     
@@ -330,6 +466,8 @@ def save_explanation_to_notes(explanation: str, start_idx: int) -> None:
         The explanation text to save.
     start_idx : int
         The starting index of the slides being explained.
+    grid_image : Optional[Image.Image]
+        The grid image to include in DOCX format.
     """
     if not st.session_state.notes_file:
         return
@@ -337,8 +475,37 @@ def save_explanation_to_notes(explanation: str, start_idx: int) -> None:
     # Save the edited version if it exists, otherwise use the original
     text_to_save = st.session_state.edited_explanations.get(start_idx, explanation)
     
-    with open(st.session_state.notes_file, "a", encoding="utf-8") as f:
-        f.write(f"\n{text_to_save}\n----\n")
+    # Get the format type from session state
+    format_type = st.session_state.notes_format
+    
+    if format_type == "txt":
+        with open(st.session_state.notes_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{text_to_save}\n----\n")
+    else:  # docx
+        # Create a new document if it doesn't exist
+        if not os.path.exists(st.session_state.notes_file):
+            doc = Document()
+        else:
+            doc = Document(st.session_state.notes_file)
+        
+        # Add the grid image if provided
+        if grid_image:
+            # Save image to bytes
+            img_byte_arr = io.BytesIO()
+            grid_image.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+            
+            # Add image to document
+            doc.add_picture(img_byte_arr, width=Inches(6))
+        
+        # Format the markdown text with proper styling
+        format_markdown_for_docx(doc, text_to_save)
+        
+        # Add separator
+        doc.add_paragraph("----")
+        
+        # Save the document
+        doc.save(st.session_state.notes_file)
     
     st.session_state.saved_notes.add(start_idx)
 
@@ -452,22 +619,114 @@ async def main():
         st.markdown("---")
         st.subheader("📝 Notes")
         
+        # Format selection in sidebar
+        if st.session_state.notes_file is None:
+            format_type = st.selectbox(
+                "Select notes format:",
+                options=["docx", "txt"],
+                index=0 if st.session_state.notes_format == "docx" else 1,
+                help="Choose the format for saving notes"
+            )
+            st.session_state.notes_format = format_type
+            st.session_state.notes_file = get_notes_filename(uploaded_file.name, format_type)
+        else:
+            # Display current format
+            st.info(f"Current format: {st.session_state.notes_format.upper()}")
+        
         # Download notes button
         if st.session_state.notes_file and os.path.exists(st.session_state.notes_file):
-            with open(st.session_state.notes_file, "r", encoding="utf-8") as f:
-                notes_content = f.read()
-            st.download_button(
-                "📥 Download Notes",
-                notes_content,
-                file_name=os.path.basename(st.session_state.notes_file),
-                mime="text/plain",
-                help="Download the saved notes as a text file"
-            )
+            if st.session_state.notes_format == "txt":
+                with open(st.session_state.notes_file, "r", encoding="utf-8") as f:
+                    notes_content = f.read()
+                st.download_button(
+                    "📥 Download Notes",
+                    notes_content,
+                    file_name=os.path.basename(st.session_state.notes_file),
+                    mime="text/plain",
+                    help="Download the saved notes as a text file"
+                )
+            else:  # docx
+                with open(st.session_state.notes_file, "rb") as f:
+                    notes_content = f.read()
+                st.download_button(
+                    "📥 Download Notes",
+                    notes_content,
+                    file_name=os.path.basename(st.session_state.notes_file),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    help="Download the saved notes as a Word document"
+                )
             
             # Clear notes button
             if st.button("🗑️ Clear Notes", help="Delete all saved notes"):
                 clear_notes()
                 st.rerun()
+            
+            # Option to change format
+            if st.button("📝 Change Format", help="Change the notes format (will clear existing notes)"):
+                clear_notes()
+                st.rerun()
+
+        # Add Context Settings section
+        st.markdown("---")
+        st.subheader("🔄 Context Settings")
+        
+        # Context size slider
+        context_size = st.slider(
+            "Number of slides in local context",
+            min_value=1,
+            max_value=5,
+            value=3,
+            help="Maximum number of previous slides to keep in immediate context"
+        )
+        if context_size != st.session_state.context_manager.context_size:
+            st.session_state.context_manager.context_size = context_size
+        
+        # Constraint Management
+        st.markdown("### 📋 Prompt Constraints")
+        
+        # Predefined constraints
+        st.markdown("#### Predefined Constraints")
+        for category, constraints in DEFAULT_CONSTRAINTS.items():
+            with st.expander(f"{category.title()} Constraints"):
+                for c_id, c_text in constraints.items():
+                    if st.checkbox(
+                        c_text,
+                        key=f"constraint_{c_id}",
+                        value=c_id in st.session_state.context_manager.active_constraints
+                    ):
+                        st.session_state.context_manager.add_constraint(c_id, c_text)
+                        st.session_state.context_manager.activate_constraint(c_id)
+                    else:
+                        st.session_state.context_manager.deactivate_constraint(c_id)
+        
+        # Custom constraints
+        st.markdown("#### Custom Constraints")
+        with st.expander("Add Custom Constraint"):
+            custom_text = st.text_area(
+                "Enter custom constraint:",
+                key="custom_constraint_input",
+                help="Describe your custom constraint for the explanation"
+            )
+            if st.button("Add Custom Constraint"):
+                if custom_text.strip():
+                    constraint_id = f"custom_{len(st.session_state.custom_constraints)}"
+                    st.session_state.custom_constraints[constraint_id] = custom_text
+                    st.session_state.context_manager.add_constraint(constraint_id, custom_text)
+                    st.session_state.context_manager.activate_constraint(constraint_id)
+                    st.success("Custom constraint added!")
+        
+        # Display active custom constraints
+        if st.session_state.custom_constraints:
+            st.markdown("#### Active Custom Constraints")
+            for c_id, c_text in st.session_state.custom_constraints.items():
+                if st.checkbox(
+                    c_text,
+                    key=f"custom_{c_id}",
+                    value=c_id in st.session_state.context_manager.active_constraints
+                ):
+                    st.session_state.context_manager.activate_constraint(c_id)
+                else:
+                    st.session_state.context_manager.deactivate_constraint(c_id)
 
     # Process uploaded file
     if uploaded_file is not None:
@@ -477,7 +736,7 @@ async def main():
                 clear_all_caches()
                 st.session_state.slides = slide_processor.process_file(uploaded_file)
                 st.session_state.last_uploaded_file = uploaded_file.name
-                st.session_state.notes_file = get_notes_filename(uploaded_file.name)
+                st.session_state.notes_file = None  # Reset notes file to trigger format selection
 
     # Main content area
     if not st.session_state.slides:
@@ -580,7 +839,11 @@ async def main():
                 
                 # Handle save action
                 if save_clicked and not is_saved:
-                    save_explanation_to_notes(edited_text, start_idx)
+                    save_explanation_to_notes(
+                        edited_text,
+                        start_idx,
+                        grid_image if st.session_state.notes_format == "docx" else None
+                    )
                     cache_page_data(
                         start_idx,
                         cols_per_row,
@@ -609,14 +872,29 @@ async def main():
                 st.image(grid_image, use_container_width=True)
                 
                 with st.spinner("Generating explanation..."):
+                    # Build prompt using context manager
+                    # Instead of trying to access text attribute, we'll describe the images
+                    current_slides_desc = f"A set of {len(current_slides)} slides being displayed in a grid format. "
+                    current_slides_desc += "These slides are part of the presentation and need to be explained in detail. "
+                    current_slides_desc += f"Currently showing slides {start_idx + 1} to {end_idx} of the presentation."
+                    
+                    prompt = st.session_state.context_manager.build_prompt(current_slides_desc)
+                    
                     explanation = await llm_interface.generate_explanation(
                         grid_image,
-                        """Explain these slides in detail, focusing on key concepts and relationships. 
-                        Use the slides as context. be concise and to the point.
-                        your response will be used to generate a voiceover for the slides,
-                        start directly with the explanation""",
+                        prompt,
                         provider=api_choice,
                         model_name=gemini_model
+                    )
+                    
+                    # Add explanation to context
+                    st.session_state.context_manager.add_explanation(
+                        explanation,
+                        st.session_state.current_slide_index,
+                        metadata={
+                            'model': gemini_model,
+                            'provider': api_choice
+                        }
                     )
                     
                     # Clean markdown before TTS
